@@ -13,7 +13,10 @@ from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Tuple
 
+from ui import Spinner, success, info, warn, error, enable_windows_ansi, CYAN, DIM, RESET, BOLD
+
 load_dotenv()
+enable_windows_ansi()
 
 # ─── Konfigurasi ────────────────────────────────────────────────
 DOCUMENT_FOLDER   = "document"
@@ -28,9 +31,10 @@ MIN_CHUNK_LEN     = 80
 CHROMA_BATCH_SIZE = 200
 BGE_PREFIX        = "passage: "
 
-# GPU otomatis jika RTX tersedia, CPU jika tidak
+# GPU otomatis jika tersedia
 DEVICE           = "cuda" if torch.cuda.is_available() else "cpu"
-EMBED_BATCH_SIZE = 64 if DEVICE == "cuda" else 32
+# Batch lebih besar di GPU karena bisa fp16 + paralel; di CPU tetap kecil
+EMBED_BATCH_SIZE = 128 if DEVICE == "cuda" else 32
 MAX_WORKERS      = 4   # thread paralel untuk ekstraksi file
 # ────────────────────────────────────────────────────────────────
 
@@ -46,45 +50,39 @@ def _file_hash(path: str) -> str:
 
 def _clean_text(text: str) -> str:
     """Normalisasi whitespace dan karakter aneh."""
-    text = re.sub(r'\n{3,}', '\n\n', text)   # max 2 baris kosong
-    text = re.sub(r'[ \t]+', ' ', text)       # spasi berulang
-    text = re.sub(r'﻿|​|\xa0', ' ', text)  # hidden chars
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'﻿|​|\xa0', ' ', text)
     return text.strip()
 
 
 def extract_pdf(file_path: str) -> List[Tuple[str, int]]:
-    """
-    Extract teks PDF per halaman.
-    Return: [(teks_bersih, nomor_halaman), ...]
-    """
+    """Extract teks PDF per halaman. Return: [(teks, page_num), ...]"""
     results = []
     try:
         with pdfplumber.open(file_path) as pdf:
             total = len(pdf.pages)
             for page_num, page in enumerate(pdf.pages, 1):
-                raw = page.extract_text(layout=False) or ""
+                raw  = page.extract_text(layout=False) or ""
                 text = _clean_text(raw)
                 if text:
                     results.append((text, page_num))
-            print(f"  ✅ PDF: {len(results)}/{total} halaman berisi teks")
+            print(f"   {DIM}PDF: {len(results)}/{total} halaman berisi teks{RESET}")
     except Exception as e:
-        print(f"  ❌ Gagal baca PDF: {e}")
+        error(f"Gagal baca PDF '{Path(file_path).name}': {e}",
+              hint="Pastikan file tidak corrupt / terenkripsi.")
     return results
 
 
 def extract_docx(file_path: str) -> List[Tuple[str, int]]:
-    """
-    Extract teks DOCX dengan deteksi page-break dari XML.
-    Return: [(teks_bersih, nomor_halaman), ...]
-    """
+    """Extract teks DOCX dengan deteksi page-break dari XML."""
     results = []
     try:
-        doc = Document(file_path)
+        doc      = Document(file_path)
         page_num = 1
         buffer: List[str] = []
 
         for para in doc.paragraphs:
-            # Cek page break di XML
             has_break = para._element.find(
                 f'.//{qn("w:lastRenderedPageBreak")}'
             ) is not None or para._element.find(
@@ -106,23 +104,20 @@ def extract_docx(file_path: str) -> List[Tuple[str, int]]:
             if text:
                 results.append((text, page_num))
 
-        print(f"  ✅ DOCX: {page_num} halaman terdeteksi")
+        print(f"   {DIM}DOCX: {page_num} halaman terdeteksi{RESET}")
     except Exception as e:
-        print(f"  ❌ Gagal baca DOCX: {e}")
+        error(f"Gagal baca DOCX '{Path(file_path).name}': {e}",
+              hint="Pastikan file tidak corrupt / terproteksi password.")
     return results
 
 
 def create_chunks(text: str, page_num: int) -> List[Dict]:
-    """
-    Chunking berbasis paragraf — tidak potong di tengah kalimat.
-    Pisah dulu per paragraf, lalu gabungkan hingga CHUNK_SIZE.
-    """
+    """Chunking berbasis paragraf — tidak potong di tengah kalimat."""
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     chunks: List[Dict] = []
     current = ""
 
     for para in paragraphs:
-        # Jika paragraf sendiri > CHUNK_SIZE, pecah per kalimat
         if len(para) > CHUNK_SIZE:
             sentences = re.split(r'(?<=[.!?])\s+', para)
             for sent in sentences:
@@ -138,7 +133,6 @@ def create_chunks(text: str, page_num: int) -> List[Dict]:
             else:
                 if current and len(current) >= MIN_CHUNK_LEN:
                     chunks.append({"text": current, "page": page_num})
-                # Overlap: ambil akhir chunk sebelumnya
                 overlap_text = current[-CHUNK_OVERLAP:] if current else ""
                 current = (overlap_text + "\n\n" + para).strip()
 
@@ -152,14 +146,14 @@ def _extract_worker(args: Tuple) -> Tuple[str, str, List[Dict]]:
     """Worker paralel: extract teks + chunking untuk satu file."""
     fp, name, fhash = args
     size_kb = os.path.getsize(str(fp)) / 1024
-    print(f"\n📄 {name}  ({size_kb:.1f} KB)")
+    print(f"\n📄 {BOLD}{name}{RESET}  {DIM}({size_kb:.1f} KB){RESET}")
 
     if name.lower().endswith(".pdf"):
         pages = extract_pdf(str(fp))
     elif name.lower().endswith(".docx"):
         pages = extract_docx(str(fp))
     else:
-        print("  ⚠️  Format tidak didukung, skip.")
+        warn(f"Format tidak didukung: {name}, skip.")
         return name, fhash, []
 
     chunks: List[Dict] = []
@@ -171,23 +165,59 @@ def _extract_worker(args: Tuple) -> Tuple[str, str, List[Dict]]:
 
 class DocumentScreener:
     def __init__(self):
-        self.chroma  = chromadb.PersistentClient(path=CHROMA_PATH)
-        self.col     = self.chroma.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"}
-        )
-        print(f"📥 Memuat embedding model BGE-M3 di {DEVICE.upper()} ...")
-        self.model   = SentenceTransformer(EMBEDDING_MODEL, device=DEVICE)
+        # Connect ChromaDB dulu (cepat) — model di-load lazy nanti
+        try:
+            self.chroma = chromadb.PersistentClient(path=CHROMA_PATH)
+            self.col    = self.chroma.get_or_create_collection(
+                name=COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"}
+            )
+        except Exception as e:
+            error(f"Gagal connect ke ChromaDB: {e}",
+                  hint=f"Hapus folder '{CHROMA_PATH}' lalu coba lagi.")
+            raise SystemExit(1)
+
+        self.model: SentenceTransformer = None  # lazy load
+        self.log   = self._load_log()
+
+    # ── Lazy load embedding model ─────────────────────────────────
+    def _ensure_model(self):
+        """Load embedding model HANYA jika benar-benar dibutuhkan.
+        Ini menghemat 30-60 detik saat 'semua file sudah up-to-date'."""
+        if self.model is not None:
+            return
+
+        device_label = DEVICE.upper()
         if DEVICE == "cuda":
-            print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print("✅ Model siap!\n")
-        self.log     = self._load_log()
+            try:
+                device_label = f"GPU ({torch.cuda.get_device_name(0)})"
+            except Exception:
+                pass
+
+        with Spinner(f"Memuat embedding model BGE-M3 di {device_label} ..."):
+            try:
+                self.model = SentenceTransformer(EMBEDDING_MODEL, device=DEVICE)
+                # fp16 di GPU → ~2x lebih cepat, kualitas embedding praktis sama
+                if DEVICE == "cuda":
+                    self.model = self.model.half()
+            except torch.cuda.OutOfMemoryError:
+                error("CUDA out of memory saat load model.",
+                      hint="Tutup aplikasi lain yang pakai GPU, atau set DEVICE=cpu.")
+                raise SystemExit(1)
+            except Exception as e:
+                error(f"Gagal load embedding model: {e}",
+                      hint="Cek koneksi internet — model di-download dari HuggingFace pertama kali.")
+                raise SystemExit(1)
+        success(f"Model siap di {device_label}")
 
     # ── Log helpers ──────────────────────────────────────────────
     def _load_log(self) -> Dict:
         if os.path.exists(PROCESSED_LOG):
-            with open(PROCESSED_LOG, "r", encoding="utf-8") as f:
-                return json.load(f)
+            try:
+                with open(PROCESSED_LOG, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                warn(f"{PROCESSED_LOG} corrupt, mulai dari awal.")
         return {}
 
     def _save_log(self):
@@ -196,18 +226,28 @@ class DocumentScreener:
 
     # ── Embedding ─────────────────────────────────────────────────
     def _embed(self, texts: List[str]) -> List[List[float]]:
-        """Embed dengan prefix BGE-M3. Batching dihandle SentenceTransformer + GPU."""
+        """Embed batch dengan prefix BGE-M3 + fp16 (di GPU)."""
         prefixed = [BGE_PREFIX + t for t in texts]
-        vecs = self.model.encode(
-            prefixed,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            batch_size=EMBED_BATCH_SIZE,
-            show_progress_bar=len(prefixed) > 50,
-        )
+        # inference_mode mematikan autograd → lebih cepat & hemat memory
+        with torch.inference_mode():
+            vecs = self.model.encode(
+                prefixed,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                batch_size=EMBED_BATCH_SIZE,
+                show_progress_bar=len(prefixed) > 50,
+            )
         return vecs.tolist()
 
-    # ── ChromaDB insert ───────────────────────────────────────────
+    # ── ChromaDB ──────────────────────────────────────────────────
+    def _delete_old_chunks(self, filename: str):
+        """Hapus chunks lama dari ChromaDB sebelum file di-reprocess.
+        Tanpa ini, re-screening file akan menghasilkan duplikat atau ID collision."""
+        try:
+            self.col.delete(where={"file": filename})
+        except Exception as e:
+            warn(f"Tidak bisa hapus chunks lama untuk {filename}: {e}")
+
     def _store(self, chunks: List[Dict], embeddings: List[List[float]], filename: str):
         """Insert ke ChromaDB dalam batch."""
         for i in range(0, len(chunks), CHROMA_BATCH_SIZE):
@@ -232,33 +272,40 @@ class DocumentScreener:
         )
 
         if not files:
-            print("⚠️  Tidak ada file di folder document.")
+            warn(f"Tidak ada file PDF/DOCX di folder '{DOCUMENT_FOLDER}'.")
             return {"new": 0, "chunks": 0}
 
-        print(f"🔍 {len(files)} file ditemukan di folder document\n")
+        info(f"{len(files)} file ditemukan di folder '{DOCUMENT_FOLDER}'")
 
-        # Filter file baru / berubah
+        # Filter file baru / berubah — hash check pakai spinner agar terlihat aktif
         new_files: List[Tuple] = []
-        for fp in files:
-            name  = fp.name
-            fhash = _file_hash(str(fp))
-            saved = self.log.get(name, {})
-            if saved.get("hash") == fhash:
-                print(f"⏭️  Skip (tidak berubah): {name}")
-            else:
+        reprocess_names: List[str] = []
+        with Spinner("Mengecek perubahan file ..."):
+            for fp in files:
+                name  = fp.name
+                fhash = _file_hash(str(fp))
+                saved = self.log.get(name, {})
+                if saved.get("hash") == fhash:
+                    continue
                 if name in self.log:
-                    print(f"🔁 File berubah, proses ulang: {name}")
+                    reprocess_names.append(name)
                 new_files.append((fp, name, fhash))
+        success(f"Pengecekan selesai: {len(new_files)} file baru/berubah, "
+                f"{len(files) - len(new_files)} sudah up-to-date")
+
+        for name in reprocess_names:
+            info(f"File berubah, akan diproses ulang: {name}")
 
         if not new_files:
-            print("\n✅ Semua file sudah up-to-date.")
+            success("Semua file sudah up-to-date — tidak ada yang perlu di-screening.")
             return {"new": 0, "chunks": 0}
 
-        print(f"\n⚡ {len(new_files)} file akan diproses ...\n")
+        # Baru sekarang load model (lazy)
+        self._ensure_model()
 
-        # ── STEP 1: Ekstraksi paralel (I/O bound → thread pool) ───
-        print("📂 Ekstraksi teks secara paralel ...")
-        file_data: Dict[str, Tuple[str, List[Dict]]] = {}  # name → (fhash, chunks)
+        # ── STEP 1: Ekstraksi paralel (I/O bound) ────────────────
+        print(f"\n{CYAN}{BOLD}📂 Ekstraksi teks paralel ({MAX_WORKERS} thread) ...{RESET}")
+        file_data: Dict[str, Tuple[str, List[Dict]]] = {}
 
         with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(new_files))) as ex:
             futures = {ex.submit(_extract_worker, f): f for f in new_files}
@@ -267,19 +314,20 @@ class DocumentScreener:
                     name, fhash, chunks = fut.result()
                     if chunks:
                         file_data[name] = (fhash, chunks)
-                        print(f"  📦 {name}: {len(chunks)} chunks")
+                        print(f"   {DIM}→ {len(chunks)} chunks dari {name}{RESET}")
                     else:
-                        print(f"  ⚠️  {name}: tidak ada chunk, skip.")
+                        warn(f"{name}: tidak ada chunk dihasilkan, skip.")
                 except Exception as e:
-                    print(f"  ❌ Error ekstraksi: {e}")
+                    error(f"Error ekstraksi: {e}")
 
         if not file_data:
+            error("Tidak ada file yang berhasil diekstrak.")
             return {"new": 0, "chunks": 0}
 
-        # ── STEP 2: Embed semua chunks sekaligus di GPU ────────────
-        all_texts   : List[str]        = []
-        chunk_owners: List[str]        = []  # nama file pemilik setiap chunk
-        chunk_objs  : List[Dict]       = []
+        # ── STEP 2: Embed semua chunks sekaligus di GPU ──────────
+        all_texts   : List[str]  = []
+        chunk_owners: List[str]  = []
+        chunk_objs  : List[Dict] = []
 
         for name, (_, chunks) in file_data.items():
             for chunk in chunks:
@@ -287,10 +335,19 @@ class DocumentScreener:
                 chunk_owners.append(name)
                 chunk_objs.append(chunk)
 
-        print(f"\n🔄 Embedding {len(all_texts)} chunks di {DEVICE.upper()} ...")
-        all_embeddings = self._embed(all_texts)
+        print(f"\n{CYAN}{BOLD}🔄 Embedding {len(all_texts)} chunks di {DEVICE.upper()} ...{RESET}")
+        try:
+            all_embeddings = self._embed(all_texts)
+        except torch.cuda.OutOfMemoryError:
+            error("CUDA out of memory saat embedding.",
+                  hint=f"Kurangi EMBED_BATCH_SIZE (sekarang {EMBED_BATCH_SIZE}) atau pakai CPU.")
+            raise SystemExit(1)
+        except Exception as e:
+            error(f"Gagal embedding: {e}")
+            raise SystemExit(1)
 
-        # ── STEP 3: Store ke ChromaDB per file ────────────────────
+        # ── STEP 3: Store ke ChromaDB per file ───────────────────
+        print(f"\n{CYAN}{BOLD}💾 Menyimpan ke ChromaDB ...{RESET}")
         file_chunks_map: Dict[str, Tuple[List[Dict], List]] = {}
         for chunk, emb, owner in zip(chunk_objs, all_embeddings, chunk_owners):
             if owner not in file_chunks_map:
@@ -300,10 +357,13 @@ class DocumentScreener:
 
         total_chunks = 0
         for name, (chunks, embeddings) in file_chunks_map.items():
+            # BUG FIX: hapus chunks lama dulu jika ini re-process
+            if name in self.log:
+                self._delete_old_chunks(name)
             self._store(chunks, embeddings, name)
             fhash = file_data[name][0]
-            self.log[name] = {"hash": fhash, "path": str(DOCUMENT_FOLDER + "/" + name)}
-            print(f"  ✅ {name}: {len(chunks)} chunks tersimpan")
+            self.log[name] = {"hash": fhash, "path": str(folder / name)}
+            print(f"   {DIM}✓ {name}: {len(chunks)} chunks{RESET}")
             total_chunks += len(chunks)
 
         self._save_log()
@@ -312,20 +372,31 @@ class DocumentScreener:
 
 def main():
     print("=" * 55)
-    print("  🎯 DOCUMENT SCREENING & VECTORIZATION")
+    print(f"  {BOLD}🎯 DOCUMENT SCREENING & VECTORIZATION{RESET}")
     print("=" * 55)
 
-    screener = DocumentScreener()
-    stats    = screener.scan_and_process()
+    try:
+        screener = DocumentScreener()
+        stats    = screener.scan_and_process()
+    except KeyboardInterrupt:
+        print()
+        warn("Dibatalkan oleh user (Ctrl+C).")
+        raise SystemExit(130)
+    except SystemExit:
+        raise
+    except Exception as e:
+        error(f"Crash tak terduga: {type(e).__name__}: {e}",
+              hint="Cek log di atas untuk konteks.")
+        raise SystemExit(1)
 
     print("\n" + "=" * 55)
-    print("  📊 RINGKASAN")
+    print(f"  {BOLD}📊 RINGKASAN{RESET}")
     print("=" * 55)
     print(f"  File diproses  : {stats['new']}")
     print(f"  Total chunks   : {stats['chunks']}")
     print(f"  Database       : {CHROMA_PATH}")
     print("=" * 55)
-    print("  ✅ Screening selesai! AI siap menjawab pertanyaan.\n")
+    success("Screening selesai! AI siap menjawab pertanyaan.\n")
 
 
 if __name__ == "__main__":
